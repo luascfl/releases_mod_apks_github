@@ -1,0 +1,16 @@
+.env
+*.env.local
+*.env.development
+*.env.production
+__pycache__/
+.gemini
+GITHUB_TOKEN
+GITHUB_TOKEN.txt
+AMO_API_KEY.txt
+AMO_API_SECRET.txt
+*API*
+.eslintcache/
+node_modules/
+dist/
+build/
+*.zip
