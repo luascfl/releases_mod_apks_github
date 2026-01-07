@@ -7,6 +7,6 @@
 [submodule "__pycache__"]
 	path = __pycache__
 	url = https://github.com/luascfl/pycache.git
-[submodule "leetmouse-gui"]
-	path = leetmouse-gui
-	url = https://github.com/luascfl/leetmouse-gui.git
+[submodule "CamScanner"]
+	path = CamScanner
+	url = https://github.com/luascfl/camscanner.git
