@@ -1,12 +1,6 @@
-[submodule "cache"]
-	path = cache
-	url = https://github.com/luascfl/cache.git
 [submodule "Endel"]
 	path = Endel
 	url = https://github.com/luascfl/endel.git
-[submodule "__pycache__"]
-	path = __pycache__
-	url = https://github.com/luascfl/pycache.git
 [submodule "CamScanner"]
 	path = CamScanner
 	url = https://github.com/luascfl/camscanner.git
