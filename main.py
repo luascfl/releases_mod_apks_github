@@ -222,6 +222,8 @@ async def main():
             subprocess.run(["./create_and_push_repo.sh", "push-subfolders-releases"], check=True)
             print("✅ Push e Releases concluídos!")
             print("\n🔗 LINKS DAS ÚLTIMAS RELEASES:")
+        except subprocess.CalledProcessError as exc:
+            logger.error(f"❌ Falha no push/repos: {exc}")
 
 if __name__ == "__main__":
     asyncio.run(main())
