@@ -4,3 +4,6 @@
 [submodule "CamScanner"]
 	path = CamScanner
 	url = https://github.com/luascfl/camscanner.git
+[submodule "temp_downloads"]
+	path = temp_downloads
+	url = https://github.com/luascfl/temp_downloads.git
