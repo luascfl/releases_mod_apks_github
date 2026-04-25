@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import glob
 import base64
+import requests
 from urllib.parse import urlparse, unquote
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any
@@ -114,74 +115,203 @@ class APKScraper:
                     self.page.get(version_links[0])
                     await asyncio.sleep(15) # Espera o timer do LiteAPKs
                 
-                # 3. Clica no botão final ou extrai o data-href
+                # 3. Extrai o link final (href ou data-href)
                 logger.info("⏳ Aguardando botão de download final...")
-                await asyncio.sleep(10) # Espera o carregamento do botão
+                await asyncio.sleep(10)  # Espera o carregamento do botão
                 
-                # Tenta extrair o link real via JS
-                js_get_real_url = """
-                    let el = document.querySelector('a.download');
-                    if (el) {
-                        // Se o href já for um link real (não #!), usa ele
-                        if (el.href && !el.href.includes('#!') && el.href.startsWith('http')) {
-                            return el.href;
+                final_url = self.extract_final_download_url(self.page.html)
+                if not final_url:
+                    # Fallback via JS para páginas com renderização dinâmica
+                    final_url = self.page.run_js("""
+                        let el = document.querySelector('#download-loaded-link, a.download, a[download], a[href*=\".apk\"]');
+                        if (!el) return null;
+                        
+                        let href = el.getAttribute('href') || el.href;
+                        if (href && href.startsWith('http') && !href.includes('#!')) {
+                            return href;
                         }
-                        // Caso contrário, tenta decodificar o data-href
-                        if (el.getAttribute('data-href')) {
-                            return atob(el.getAttribute('data-href'));
+                        
+                        let dataHref = el.getAttribute('data-href');
+                        if (dataHref) {
+                            try {
+                                return atob(dataHref);
+                            } catch (err) {
+                                return null;
+                            }
                         }
-                    }
-                    return null;
-                """
-                
-                final_url = self.page.run_js(js_get_real_url)
+                        
+                        return null;
+                    """)
                 
                 if final_url:
-                    logger.info(f"🚀 Link direto (decodificado): {final_url}")
-                    # Inicia download nativo do arquivo real
-                    self.page.download(final_url, TEMP_DOWNLOAD_DIR)
-                    return await self.wait_and_move_download(folder, app_name)
-                else:
-                    logger.error("❌ Não foi possível encontrar o link final decodificado.")
+                    final_url = unquote(str(final_url)).replace('&amp;', '&').strip()
+                    logger.info(f"🚀 Link direto detectado: {final_url}")
+
+                    downloaded_file = await asyncio.to_thread(self.download_apk_with_requests, final_url)
+                    if downloaded_file:
+                        return await self.wait_and_move_download(folder, app_name, downloaded_file)
+
+                    logger.error("❌ Falha no download direto do APK.")
+                    return False
+                
+                logger.error("❌ Não foi possível encontrar o link final decodificado.")
         return False
                         
-        return False
 
-    async def wait_and_move_download(self, target_folder: str, app_name: str):
+    def extract_final_download_url(self, page_html: str) -> str:
+        if not page_html:
+            return ""
+
+        # Tenta primeiro links diretos já prontos no HTML
+        direct_patterns = [
+            r'id="download-loaded-link"[^>]*href="([^"]+)"',
+            r'class="[^"]*\bdownload\b[^"]*"[^>]*href="([^"]+)"',
+            r'href="(https?://[^"\s>]+\.apk[^"\s>]*)"',
+        ]
+
+        for pattern in direct_patterns:
+            match = re.search(pattern, page_html, flags=re.IGNORECASE | re.DOTALL)
+            if not match:
+                continue
+
+            candidate = unquote(match.group(1)).replace('&amp;', '&').strip()
+            if candidate.startswith('http') and '#!' not in candidate:
+                return candidate
+
+        # Fallback para data-href base64
+        data_href_match = re.search(r'data-href="([^"]+)"', page_html, flags=re.IGNORECASE)
+        if not data_href_match:
+            return ""
+
+        try:
+            decoded = base64.b64decode(data_href_match.group(1)).decode('utf-8')
+            decoded = unquote(decoded).replace('&amp;', '&').strip()
+            if decoded.startswith('http'):
+                return decoded
+        except Exception:
+            return ""
+
+        return ""
+
+    def get_browser_cookies(self) -> Dict[str, str]:
+        cookies: Dict[str, str] = {}
+        if not self.page:
+            return cookies
+
+        try:
+            raw_cookies = self.page.cookies(all_domains=True, all_info=True)
+        except Exception as exc:
+            logger.warning(f"⚠️ Falha ao ler cookies do navegador: {exc}")
+            return cookies
+
+        if isinstance(raw_cookies, dict):
+            for name, value in raw_cookies.items():
+                if name and value is not None:
+                    cookies[str(name)] = str(value)
+            return cookies
+
+        if isinstance(raw_cookies, (list, tuple, set)):
+            for item in raw_cookies:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get('name')
+                value = item.get('value')
+                if name and value is not None:
+                    cookies[str(name)] = str(value)
+
+        return cookies
+
+    def download_apk_with_requests(self, file_url: str) -> str:
+        parsed = urlparse(file_url)
+        file_name = os.path.basename(unquote(parsed.path)) or f"apk_{int(time.time())}.apk"
+        if not file_name.lower().endswith('.apk'):
+            file_name = f"{file_name}.apk"
+
+        target_path = os.path.join(TEMP_DOWNLOAD_DIR, file_name)
+        part_path = f"{target_path}.part"
+        referer = self.page.url if self.page else "https://liteapks.com/"
+
+        headers = {
+            'User-Agent': random.choice(USER_AGENTS),
+            'Referer': referer,
+            'Accept': '*/*',
+            'Connection': 'keep-alive',
+        }
+        cookies = self.get_browser_cookies()
+
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                if os.path.exists(part_path):
+                    os.remove(part_path)
+
+                logger.info(f"📥 Baixando APK (tentativa {attempt}/3)...")
+                with requests.get(
+                    file_url,
+                    headers=headers,
+                    cookies=cookies if cookies else None,
+                    stream=True,
+                    allow_redirects=True,
+                    timeout=(30, 180),
+                ) as response:
+                    response.raise_for_status()
+                    with open(part_path, 'wb') as apk_file:
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                apk_file.write(chunk)
+
+                os.replace(part_path, target_path)
+                logger.info(f"✅ Download concluído: {target_path}")
+                return target_path
+            except Exception as exc:
+                last_error = exc
+                logger.warning(f"⚠️ Tentativa {attempt} falhou: {exc}")
+                time.sleep(attempt * 2)
+
+        if os.path.exists(part_path):
+            os.remove(part_path)
+        logger.error(f"❌ Download falhou após 3 tentativas: {last_error}")
+        return ""
+
+    async def wait_and_move_download(self, target_folder: str, app_name: str, downloaded_file: str = ""):
         timeout = 300
         start_time = time.time()
-        
+
         dest_dir = os.path.join(BASE_DIR, target_folder)
         os.makedirs(dest_dir, exist_ok=True)
 
+        def move_file(latest_apk: str) -> bool:
+            version = self.extract_version_from_apk(latest_apk)
+            version = re.sub(r'[^\w\.-]', '', version)
+
+            final_path = os.path.join(dest_dir, f"{app_name}_v{version}.apk")
+            if os.path.exists(final_path):
+                logger.info(f"⏭️ Versão {version} já existe.")
+                os.remove(latest_apk)
+                return True
+
+            shutil.move(latest_apk, final_path)
+            logger.info(f"🚀 Movido para: {final_path}")
+            return True
+
+        if downloaded_file and os.path.exists(downloaded_file):
+            logger.info(f"✨ APK baixado diretamente: {downloaded_file}")
+            return move_file(downloaded_file)
+
         logger.info(f"📂 Monitorando {TEMP_DOWNLOAD_DIR}...")
-        
         while time.time() - start_time < timeout:
             # Verifica arquivos na pasta temporária
             apks = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, "*.apk"))
             crdownloads = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, "*.crdownload"))
             tmp_files = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, "*.tmp"))
-            
+
             if not crdownloads and not tmp_files and apks:
                 latest_apk = max(apks, key=os.path.getctime)
                 logger.info(f"✨ Novo APK encontrado: {latest_apk}")
-                
-                version = self.extract_version_from_apk(latest_apk)
-                version = re.sub(r'[^\w\.-]', '', version)
-                
-                final_path = os.path.join(dest_dir, f"{app_name}_v{version}.apk")
-                
-                if os.path.exists(final_path):
-                    logger.info(f"⏭️ Versão {version} já existe.")
-                    os.remove(latest_apk)
-                    return True
-                
-                shutil.move(latest_apk, final_path)
-                logger.info(f"🚀 Movido para: {final_path}")
-                return True
-            
+                return move_file(latest_apk)
+
             await asyncio.sleep(2)
-            
+
         logger.error("❌ Timeout aguardando download.")
         return False
 
@@ -219,7 +349,7 @@ async def main():
         print("\n🏁 Finalizado.")
         print("\n🚀 Iniciando Push para GitHub (Subfolders + Releases)...")
         try:
-            subprocess.run(["./create_and_push_repo.sh", "push-subfolders-releases"], check=True)
+            subprocess.run(["./create_and_push_repo.sh", "push"], check=True)
             print("✅ Push e Releases concluídos!")
             print("\n🔗 LINKS DAS ÚLTIMAS RELEASES:")
         except subprocess.CalledProcessError as exc:
