@@ -152,10 +152,10 @@ class APKScraper:
                         return await self.wait_and_move_download(folder, app_name, downloaded_file)
 
                     logger.error("❌ Falha no download direto do APK.")
-                    return False
+                    return ""
                 
                 logger.error("❌ Não foi possível encontrar o link final decodificado.")
-        return False
+        return ""
                         
 
     def extract_final_download_url(self, page_html: str) -> str:
@@ -273,26 +273,28 @@ class APKScraper:
         logger.error(f"❌ Download falhou após 3 tentativas: {last_error}")
         return ""
 
-    async def wait_and_move_download(self, target_folder: str, app_name: str, downloaded_file: str = ""):
+    async def wait_and_move_download(self, target_folder: str, app_name: str, downloaded_file: str = "") -> str:
         timeout = 300
         start_time = time.time()
 
         dest_dir = os.path.join(BASE_DIR, target_folder)
         os.makedirs(dest_dir, exist_ok=True)
 
-        def move_file(latest_apk: str) -> bool:
+        def move_file(latest_apk: str) -> str:
             version = self.extract_version_from_apk(latest_apk)
-            version = re.sub(r'[^\w\.-]', '', version)
+            if not version or version == "unknown":
+                version = self.extract_version_from_filename(os.path.basename(latest_apk))
+            version = re.sub(r'[^\w\.-]', '', version or "unknown")
 
             final_path = os.path.join(dest_dir, f"{app_name}_v{version}.apk")
             if os.path.exists(final_path):
                 logger.info(f"⏭️ Versão {version} já existe.")
                 os.remove(latest_apk)
-                return True
+                return final_path
 
             shutil.move(latest_apk, final_path)
             logger.info(f"🚀 Movido para: {final_path}")
-            return True
+            return final_path
 
         if downloaded_file and os.path.exists(downloaded_file):
             logger.info(f"✨ APK baixado diretamente: {downloaded_file}")
@@ -313,7 +315,7 @@ class APKScraper:
             await asyncio.sleep(2)
 
         logger.error("❌ Timeout aguardando download.")
-        return False
+        return ""
 
     def extract_version_from_apk(self, file_path: str) -> str:
         if not APK: return "unknown"
@@ -321,6 +323,126 @@ class APKScraper:
             apk = APK(file_path)
             return apk.version_name or apk.version_code or "unknown"
         except: return "unknown"
+
+    def extract_version_from_filename(self, file_name: str) -> str:
+        match = re.search(r'_v([0-9]+(?:\.[0-9]+)+)', file_name)
+        if not match:
+            return ""
+        return match.group(1)
+
+    def load_github_token(self) -> str:
+        env_token = os.getenv("GITHUB_TOKEN", "").strip()
+        if env_token:
+            return env_token
+
+        token_file = os.path.join(BASE_DIR, "GITHUB_TOKEN.txt")
+        if not os.path.exists(token_file):
+            return ""
+        with open(token_file, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+
+    def ensure_release_asset(self, repo_name: str, apk_path: str) -> bool:
+        token = self.load_github_token()
+        if not token:
+            logger.error("❌ GITHUB_TOKEN não encontrado (env ou GITHUB_TOKEN.txt).")
+            return False
+
+        file_name = os.path.basename(apk_path)
+        version = self.extract_version_from_filename(file_name)
+        if not version:
+            logger.error(f"❌ Não foi possível extrair versão do arquivo: {file_name}")
+            return False
+
+        tag_name = f"v{version}"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+        try:
+            release_url = f"https://api.github.com/repos/luascfl/{repo_name}/releases/tags/{tag_name}"
+            response = requests.get(release_url, headers=headers, timeout=30)
+            if response.status_code == 404:
+                create_url = f"https://api.github.com/repos/luascfl/{repo_name}/releases"
+                payload = {
+                    "tag_name": tag_name,
+                    "name": f"Release {tag_name}",
+                    "body": f"Automated release of {tag_name}",
+                    "draft": False,
+                    "prerelease": False,
+                    "target_commitish": "main",
+                }
+                response = requests.post(create_url, headers=headers, json=payload, timeout=30)
+                response.raise_for_status()
+                release_data = response.json()
+                logger.info(f"✅ Release criada: {repo_name}/{tag_name}")
+            else:
+                response.raise_for_status()
+                release_data = response.json()
+                logger.info(f"✅ Release já existe: {repo_name}/{tag_name}")
+
+            existing_assets = {asset.get("name") for asset in release_data.get("assets", [])}
+            if file_name in existing_assets:
+                logger.info(f"✅ Asset já existe na release: {file_name}")
+                return True
+
+            upload_url = release_data.get("upload_url", "").split("{")[0]
+            if not upload_url:
+                logger.error("❌ upload_url ausente na resposta da release.")
+                return False
+
+            upload_headers = headers.copy()
+            upload_headers["Content-Type"] = "application/vnd.android.package-archive"
+
+            with open(apk_path, "rb") as apk_file:
+                upload_response = requests.post(
+                    upload_url,
+                    params={"name": file_name},
+                    headers=upload_headers,
+                    data=apk_file,
+                    timeout=(30, 1800),
+                )
+
+            if upload_response.status_code not in (200, 201):
+                logger.error(f"❌ Falha ao enviar asset: {upload_response.status_code} - {upload_response.text[:300]}")
+                return False
+
+            browser_url = upload_response.json().get("browser_download_url")
+            logger.info(f"✅ Asset publicado: {browser_url}")
+            return True
+        except Exception as exc:
+            logger.error(f"❌ Falha ao publicar release: {exc}")
+            return False
+
+    def cleanup_local_apks_for_release_only(self, target_folder: str):
+        folder_path = os.path.join(BASE_DIR, target_folder)
+        os.makedirs(folder_path, exist_ok=True)
+
+        gitignore_path = os.path.join(folder_path, ".gitignore")
+        if os.path.exists(gitignore_path):
+            with open(gitignore_path, "r", encoding="utf-8") as fh:
+                content = fh.read()
+        else:
+            content = ""
+
+        if "*.apk" not in {line.strip() for line in content.splitlines()}:
+            with open(gitignore_path, "a", encoding="utf-8") as fh:
+                if content and not content.endswith("\n"):
+                    fh.write("\n")
+                fh.write("*.apk\n")
+            logger.info(f"✅ .gitignore atualizado em {target_folder} com *.apk")
+
+        removed = []
+        for apk_file in glob.glob(os.path.join(folder_path, "*.apk")):
+            os.remove(apk_file)
+            removed.append(os.path.basename(apk_file))
+
+        if removed:
+            logger.info(f"🧹 APKs removidos do repo {target_folder}: {', '.join(removed)}")
+        else:
+            logger.info(f"ℹ️ Nenhum APK local para remover em {target_folder}")
+
 
     async def cleanup(self):
         if self.page: self.page.quit()
@@ -334,7 +456,7 @@ async def main():
 
     apps = [
         {"name": "Endel", "folder": "Endel", "repo": "endel", "url": "https://liteapks.com/endel.html"},
-        {"name": "CamScanner", "folder": "CamScanner", "repo": "camscanner", "url": "https://liteapks.com/camscanner.html"}
+        {"name": "CamScanner", "folder": "CamScanner", "repo": "CamScanner", "url": "https://liteapks.com/camscanner.html"}
     ]
 
     scraper = APKScraper()
@@ -342,8 +464,16 @@ async def main():
         await scraper.init_browser()
         for app in apps:
             print(f"\n📱 {app['name']}...")
-            success = await scraper.process_liteapks(app)
-            if not success: logger.error(f"❌ Falha {app['name']}")
+            final_apk_path = await scraper.process_liteapks(app)
+            if not final_apk_path:
+                logger.error(f"❌ Falha no download de {app['name']}")
+                continue
+
+            if not scraper.ensure_release_asset(app['repo'], final_apk_path):
+                logger.error(f"❌ Falha ao publicar release de {app['name']}")
+                continue
+
+            scraper.cleanup_local_apks_for_release_only(app['folder'])
     finally:
         await scraper.cleanup()
         print("\n🏁 Finalizado.")
