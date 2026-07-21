@@ -35,6 +35,8 @@ LOGS_DIR = os.path.join(BASE_DIR, 'logs')
 TEMP_DOWNLOAD_DIR = os.path.join(BASE_DIR, 'temp_downloads')
 DOWNLOADS_DIR = BASE_DIR
 
+ALREADY_PUBLISHED = "__ALREADY_PUBLISHED__"
+
 for d in [LOGS_DIR, TEMP_DOWNLOAD_DIR]:
     os.makedirs(d, exist_ok=True)
 
@@ -225,6 +227,11 @@ class APKScraper:
                     if existing_apk:
                         logger.info(f"⏭️ APK já existe localmente para {app_name} v{target_version}: {existing_apk}")
                         return existing_apk
+
+                    expected_asset_name = f"{app_name}_v{target_version}.apk" if target_version else ""
+                    if self.release_asset_exists(app_config['repo'], target_version, expected_asset_name):
+                        logger.info(f"⏭️ Release já publicada para {app_name} v{target_version}: {expected_asset_name}. Download ignorado.")
+                        return ALREADY_PUBLISHED
 
                     downloaded_file = await asyncio.to_thread(self.download_apk_with_requests, final_url)
                     if downloaded_file:
@@ -509,6 +516,33 @@ class APKScraper:
         with open(token_file, "r", encoding="utf-8") as fh:
             return fh.read().strip()
 
+    def release_asset_exists(self, repo_name: str, version: str, asset_name: str) -> bool:
+        if not version or not asset_name:
+            return False
+
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        token = self.load_github_token()
+        if token:
+            headers["Authorization"] = f"token {token}"
+
+        try:
+            release_url = f"https://api.github.com/repos/luascfl/{repo_name}/releases/tags/v{version}"
+            response = requests.get(release_url, headers=headers, timeout=30)
+            if response.status_code == 404:
+                return False
+
+            response.raise_for_status()
+            release_data = response.json()
+            existing_assets = {asset.get("name") for asset in release_data.get("assets", [])}
+            return asset_name in existing_assets
+        except Exception as exc:
+            logger.warning(f"⚠️ Falha ao verificar asset já publicado: {exc}")
+            return False
+
+
     def ensure_release_asset(self, repo_name: str, apk_path: str) -> bool:
         token = self.load_github_token()
         if not token:
@@ -759,6 +793,10 @@ async def main():
         for app in apps:
             print(f"\n📱 {app['name']}...")
             final_apk_path = await scraper.process_liteapks(app)
+            if final_apk_path == ALREADY_PUBLISHED:
+                logger.info(f"ℹ️ {app['name']} já está publicado na release. Nada para baixar.")
+                continue
+
             if not final_apk_path:
                 logger.error(f"❌ Falha no download de {app['name']}")
                 continue
