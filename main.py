@@ -230,7 +230,20 @@ class APKScraper:
 
                     expected_asset_name = f"{app_name}_v{target_version}.apk" if target_version else ""
                     if self.release_asset_exists(app_config['repo'], target_version, expected_asset_name):
-                        logger.info(f"⏭️ Release já publicada para {app_name} v{target_version}: {expected_asset_name}. Download ignorado.")
+                        logger.info(f"⏭️ Release já publicada para {app_name} v{target_version}: {expected_asset_name}.")
+                        if self.should_install_published_release(app_config.get('package_name', ''), target_version):
+                            logger.info("📥 Baixando asset da release publicada para instalar/atualizar via adb...")
+                            published_asset = await asyncio.to_thread(
+                                self.download_published_release_asset,
+                                app_config['repo'],
+                                target_version,
+                                expected_asset_name,
+                            )
+                            if published_asset:
+                                return await self.wait_and_move_download(folder, app_name, published_asset)
+                            logger.error("❌ Falha ao baixar asset já publicado para instalação via adb.")
+                            return ""
+                        logger.info("ℹ️ Download ignorado porque a release já está publicada e não há necessidade de instalar localmente.")
                         return ALREADY_PUBLISHED
 
                     downloaded_file = await asyncio.to_thread(self.download_apk_with_requests, final_url)
@@ -542,6 +555,93 @@ class APKScraper:
             logger.warning(f"⚠️ Falha ao verificar asset já publicado: {exc}")
             return False
 
+    def should_install_published_release(self, package_name: str, target_version: str) -> bool:
+        if not package_name or not target_version:
+            return False
+
+        adb_path = self.get_adb_path()
+        if not adb_path:
+            return False
+
+        devices = self.list_connected_adb_devices()
+        if len(devices) != 1:
+            return False
+
+        serial = devices[0]
+        installed_metadata = self.get_installed_app_metadata(adb_path, serial, package_name)
+        if not installed_metadata:
+            logger.info(f"ℹ️ App {package_name} não está instalado no dispositivo. Asset da release será baixado para instalação.")
+            return True
+
+        installed_version_name = installed_metadata.get("version_name", "")
+        logger.info(
+            f"📱 Versão instalada no dispositivo para {package_name}: {installed_version_name or '?'} | "
+            f"versão da release: {target_version}"
+        )
+        if installed_version_name == target_version:
+            logger.info("ℹ️ Dispositivo já está na mesma versão publicada. Sem download adicional.")
+            return False
+
+        logger.info("⬆️ Dispositivo está em versão diferente. Asset da release será baixado para atualização.")
+        return True
+
+    def download_published_release_asset(self, repo_name: str, version: str, asset_name: str) -> str:
+        if not version or not asset_name:
+            return ""
+
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        token = self.load_github_token()
+        if token:
+            headers["Authorization"] = f"token {token}"
+
+        try:
+            release_url = f"https://api.github.com/repos/luascfl/{repo_name}/releases/tags/v{version}"
+            response = requests.get(release_url, headers=headers, timeout=30)
+            response.raise_for_status()
+            release_data = response.json()
+
+            asset = next((item for item in release_data.get("assets", []) if item.get("name") == asset_name), None)
+            if not asset:
+                logger.error(f"❌ Asset não encontrado na release publicada: {asset_name}")
+                return ""
+
+            download_url = asset.get("browser_download_url", "")
+            if not download_url:
+                logger.error(f"❌ browser_download_url ausente para o asset {asset_name}")
+                return ""
+
+            target_path = os.path.join(TEMP_DOWNLOAD_DIR, asset_name)
+            part_path = f"{target_path}.part"
+            if os.path.exists(part_path):
+                os.remove(part_path)
+
+            asset_size = int(asset.get("size") or 0)
+            progress = ConsoleProgressBar("Download release APK", asset_size)
+            logger.info(f"📦 Baixando asset já publicado: {asset_name} ({asset_size / (1024 * 1024):.2f} MB)")
+
+            with requests.get(download_url, stream=True, timeout=(30, 1800)) as asset_response:
+                asset_response.raise_for_status()
+                downloaded_bytes = 0
+                with open(part_path, "wb") as apk_file:
+                    for chunk in asset_response.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        apk_file.write(chunk)
+                        downloaded_bytes += len(chunk)
+                        progress.update(downloaded_bytes)
+
+            progress.finish()
+            os.replace(part_path, target_path)
+            logger.info(f"✅ Asset da release baixado: {target_path}")
+            return target_path
+        except Exception as exc:
+            logger.error(f"❌ Falha ao baixar asset já publicado: {exc}")
+            return ""
+
+
 
     def ensure_release_asset(self, repo_name: str, apk_path: str) -> bool:
         token = self.load_github_token()
@@ -782,8 +882,8 @@ async def main():
     print("="*50)
 
     apps = [
-        {"name": "Endel", "folder": "Endel", "repo": "endel", "url": "https://liteapks.com/endel.html"},
-        {"name": "CamScanner", "folder": "CamScanner", "repo": "CamScanner", "url": "https://liteapks.com/camscanner.html"}
+        {"name": "Endel", "folder": "Endel", "repo": "endel", "package_name": "com.endel.endel", "url": "https://liteapks.com/endel.html"},
+        {"name": "CamScanner", "folder": "CamScanner", "repo": "CamScanner", "package_name": "com.intsig.camscanner", "url": "https://liteapks.com/camscanner.html"}
     ]
 
     scraper = APKScraper()
