@@ -46,6 +46,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger("APK_Downloader")
 
+class ProgressFile:
+    def __init__(self, file_path: str, label: str, total_size: int, step_percent: int = 5):
+        self._fh = open(file_path, "rb")
+        self.label = label
+        self.total_size = total_size
+        self.step_percent = step_percent
+        self.sent_bytes = 0
+        self.next_report_percent = step_percent
+        self.finished_logged = False
+
+    def read(self, size: int = -1):
+        chunk = self._fh.read(size)
+        if chunk:
+            self.sent_bytes += len(chunk)
+            self._report_progress()
+        return chunk
+
+    def _report_progress(self):
+        if not self.total_size:
+            return
+        percent = int((self.sent_bytes / self.total_size) * 100)
+        while percent >= self.next_report_percent and self.next_report_percent < 100:
+            logger.info(f"⏫ {self.label}: {self.next_report_percent}%")
+            self.next_report_percent += self.step_percent
+        if self.sent_bytes >= self.total_size and not self.finished_logged:
+            logger.info(f"⏫ {self.label}: 100%")
+            self.finished_logged = True
+
+    def close(self):
+        self._fh.close()
+
+    def __len__(self):
+        return self.total_size
+
+    def __getattr__(self, name):
+        return getattr(self._fh, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
 USER_AGENTS = [
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 ]
@@ -71,8 +116,11 @@ class APKScraper:
     async def init_browser(self):
         try:
             co = ChromiumOptions()
+            co.auto_port()
             co.set_argument('--no-sandbox')
             co.set_argument('--disable-gpu')
+            if HEADLESS_MODE:
+                co.headless()
             if os.path.exists('/usr/bin/google-chrome'):
                 co.set_browser_path('/usr/bin/google-chrome')
             co.set_user_agent(random.choice(USER_AGENTS))
@@ -255,10 +303,32 @@ class APKScraper:
                     timeout=(30, 180),
                 ) as response:
                     response.raise_for_status()
+                    total_size = int(response.headers.get("content-length") or 0)
+                    downloaded_bytes = 0
+                    next_percent_report = 5
+                    next_bytes_report = 25 * 1024 * 1024
+
+                    if total_size:
+                        logger.info(f"📦 Tamanho do download: {total_size / (1024 * 1024):.2f} MB")
+                    else:
+                        logger.info("📦 Tamanho do download não informado pelo servidor.")
+
                     with open(part_path, 'wb') as apk_file:
                         for chunk in response.iter_content(chunk_size=1024 * 1024):
-                            if chunk:
-                                apk_file.write(chunk)
+                            if not chunk:
+                                continue
+
+                            apk_file.write(chunk)
+                            downloaded_bytes += len(chunk)
+
+                            if total_size:
+                                percent = int((downloaded_bytes / total_size) * 100)
+                                while percent >= next_percent_report and next_percent_report <= 100:
+                                    logger.info(f"⏬ Download APK: {next_percent_report}%")
+                                    next_percent_report += 5
+                            elif downloaded_bytes >= next_bytes_report:
+                                logger.info(f"⏬ Download APK: {downloaded_bytes / (1024 * 1024):.2f} MB recebidos")
+                                next_bytes_report += 25 * 1024 * 1024
 
                 os.replace(part_path, target_path)
                 logger.info(f"✅ Download concluído: {target_path}")
@@ -330,6 +400,66 @@ class APKScraper:
             return ""
         return match.group(1)
 
+    def extract_apk_metadata(self, file_path: str) -> Dict[str, str]:
+        if not APK:
+            return {}
+
+        try:
+            apk = APK(file_path)
+            package_name = ""
+            version_name = ""
+            version_code = ""
+
+            if hasattr(apk, "get_package"):
+                package_name = apk.get_package() or ""
+            if not package_name:
+                package_name = getattr(apk, "packagename", "") or ""
+
+            if hasattr(apk, "get_androidversion_name"):
+                version_name = apk.get_androidversion_name() or ""
+            if not version_name:
+                version_name = getattr(apk, "version_name", "") or ""
+
+            if hasattr(apk, "get_androidversion_code"):
+                version_code = str(apk.get_androidversion_code() or "")
+            if not version_code:
+                version_code = str(getattr(apk, "version_code", "") or "")
+
+            return {
+                "package_name": package_name.strip(),
+                "version_name": str(version_name).strip(),
+                "version_code": str(version_code).strip(),
+            }
+        except Exception as exc:
+            logger.warning(f"⚠️ Falha ao extrair metadados do APK: {exc}")
+            return {}
+
+    def get_installed_app_metadata(self, adb_path: str, serial: str, package_name: str) -> Dict[str, str]:
+        try:
+            result = subprocess.run(
+                [adb_path, "-s", serial, "shell", "dumpsys", "package", package_name],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except Exception as exc:
+            logger.warning(f"⚠️ Falha ao consultar versão instalada via adb: {exc}")
+            return {}
+
+        output = "\n".join(part for part in [(result.stdout or "").strip(), (result.stderr or "").strip()] if part)
+        if result.returncode != 0 or "Unable to find package" in output or "Package [" in output and "was not found" in output:
+            return {}
+
+        version_name_match = re.search(r"versionName=([^\s]+)", output)
+        version_code_match = re.search(r"versionCode=(\d+)", output)
+        return {
+            "package_name": package_name,
+            "version_name": version_name_match.group(1).strip() if version_name_match else "",
+            "version_code": version_code_match.group(1).strip() if version_code_match else "",
+        }
+
+
     def load_github_token(self) -> str:
         env_token = os.getenv("GITHUB_TOKEN", "").strip()
         if env_token:
@@ -388,14 +518,19 @@ class APKScraper:
                 return True
 
             upload_url = release_data.get("upload_url", "").split("{")[0]
+            file_size_bytes = os.path.getsize(apk_path)
+            file_size_mb = file_size_bytes / (1024 * 1024)
+            logger.info(f"📤 Enviando asset para a release: {file_name} ({file_size_mb:.2f} MB). Pode levar alguns minutos.")
+
             if not upload_url:
                 logger.error("❌ upload_url ausente na resposta da release.")
                 return False
 
             upload_headers = headers.copy()
             upload_headers["Content-Type"] = "application/vnd.android.package-archive"
+            upload_headers["Content-Length"] = str(file_size_bytes)
 
-            with open(apk_path, "rb") as apk_file:
+            with ProgressFile(apk_path, f"Upload release {file_name}", file_size_bytes) as apk_file:
                 upload_response = requests.post(
                     upload_url,
                     params={"name": file_name},
@@ -444,6 +579,126 @@ class APKScraper:
             logger.info(f"ℹ️ Nenhum APK local para remover em {target_folder}")
 
 
+    def get_adb_path(self) -> str:
+        return shutil.which("adb") or ""
+
+    def list_connected_adb_devices(self) -> List[str]:
+        adb_path = self.get_adb_path()
+        if not adb_path:
+            logger.info("ℹ️ adb não encontrado no PATH. Instalação no dispositivo será ignorada.")
+            return []
+
+        try:
+            result = subprocess.run(
+                [adb_path, "devices"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except Exception as exc:
+            logger.warning(f"⚠️ Falha ao consultar dispositivos adb: {exc}")
+            return []
+
+        if result.returncode != 0:
+            logger.warning(f"⚠️ adb devices falhou: {(result.stderr or result.stdout).strip()}")
+            return []
+
+        devices: List[str] = []
+        blocked: List[str] = []
+        for raw_line in result.stdout.splitlines()[1:]:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+
+            serial, state = parts[0], parts[1]
+            if state == "device":
+                devices.append(serial)
+            else:
+                blocked.append(f"{serial} ({state})")
+
+        if blocked:
+            logger.warning(f"⚠️ Dispositivos adb indisponíveis: {', '.join(blocked)}")
+
+        return devices
+
+    def install_apk_if_adb_available(self, apk_path: str) -> bool:
+        adb_path = self.get_adb_path()
+        if not adb_path:
+            logger.info("ℹ️ adb não encontrado no PATH. Instalação automática ignorada.")
+            return False
+
+        devices = self.list_connected_adb_devices()
+        if not devices:
+            logger.info("ℹ️ Nenhum dispositivo adb conectado em estado 'device'.")
+            return False
+
+        if len(devices) > 1:
+            logger.warning(f"⚠️ Mais de um dispositivo adb conectado ({', '.join(devices)}). Instalação automática ignorada.")
+            return False
+
+        serial = devices[0]
+        apk_metadata = self.extract_apk_metadata(apk_path)
+        package_name = apk_metadata.get("package_name", "")
+        apk_version_name = apk_metadata.get("version_name", "")
+        apk_version_code = apk_metadata.get("version_code", "")
+
+        if package_name:
+            installed_metadata = self.get_installed_app_metadata(adb_path, serial, package_name)
+            if installed_metadata:
+                installed_version_name = installed_metadata.get("version_name", "")
+                installed_version_code = installed_metadata.get("version_code", "")
+                logger.info(
+                    f"📱 Versão instalada no dispositivo para {package_name}: "
+                    f"name={installed_version_name or '?'} code={installed_version_code or '?'}"
+                )
+                logger.info(
+                    f"📦 Versão do APK baixado: "
+                    f"name={apk_version_name or '?'} code={apk_version_code or '?'}"
+                )
+
+                same_version_name = bool(installed_version_name and apk_version_name and installed_version_name == apk_version_name)
+                same_version_code = bool(installed_version_code and apk_version_code and installed_version_code == apk_version_code)
+                if same_version_name and (same_version_code or not installed_version_code or not apk_version_code):
+                    logger.info("ℹ️ O mesmo build já está instalado no dispositivo. Instalação ignorada.")
+                    return False
+
+                logger.info("⬆️ Versão diferente detectada no dispositivo. Atualização será aplicada.")
+            else:
+                logger.info(f"ℹ️ App {package_name} não está instalado no dispositivo. Instalação será feita.")
+        else:
+            logger.warning("⚠️ Não foi possível identificar o pacote do APK. Tentando instalar mesmo assim.")
+
+        logger.info(f"📲 Instalando APK via adb no dispositivo {serial}...")
+
+        try:
+            result = subprocess.run(
+                [adb_path, "-s", serial, "install", "-r", apk_path],
+                capture_output=True,
+                text=True,
+                timeout=900,
+                check=False,
+            )
+        except Exception as exc:
+            logger.warning(f"⚠️ Falha ao instalar APK via adb: {exc}")
+            return False
+
+        output = (result.stdout or "").strip()
+        error_output = (result.stderr or "").strip()
+        if result.returncode == 0:
+            if output:
+                logger.info(f"✅ Instalação adb concluída: {output}")
+            else:
+                logger.info("✅ Instalação adb concluída.")
+            return True
+
+        logger.warning(f"⚠️ Instalação adb falhou: {(error_output or output or f'código {result.returncode}')}")
+        return False
+
     async def cleanup(self):
         if self.page: self.page.quit()
         if os.path.exists(TEMP_DOWNLOAD_DIR):
@@ -460,6 +715,7 @@ async def main():
     ]
 
     scraper = APKScraper()
+    should_push = False
     try:
         await scraper.init_browser()
         for app in apps:
@@ -469,21 +725,27 @@ async def main():
                 logger.error(f"❌ Falha no download de {app['name']}")
                 continue
 
+            scraper.install_apk_if_adb_available(final_apk_path)
+
             if not scraper.ensure_release_asset(app['repo'], final_apk_path):
                 logger.error(f"❌ Falha ao publicar release de {app['name']}")
                 continue
 
             scraper.cleanup_local_apks_for_release_only(app['folder'])
+            should_push = True
     finally:
         await scraper.cleanup()
         print("\n🏁 Finalizado.")
-        print("\n🚀 Iniciando Push para GitHub (Subfolders + Releases)...")
-        try:
-            subprocess.run(["./create_and_push_repo.sh", "push"], check=True)
-            print("✅ Push e Releases concluídos!")
-            print("\n🔗 LINKS DAS ÚLTIMAS RELEASES:")
-        except subprocess.CalledProcessError as exc:
-            logger.error(f"❌ Falha no push/repos: {exc}")
+        if should_push:
+            print("\n🚀 Iniciando Push para GitHub (Subfolders + Releases)...")
+            try:
+                subprocess.run(["./create_and_push_repo.sh", "push"], check=True)
+                print("✅ Push e Releases concluídos!")
+                print("\n🔗 LINKS DAS ÚLTIMAS RELEASES:")
+            except subprocess.CalledProcessError as exc:
+                logger.error(f"❌ Falha no push/repos: {exc}")
+        else:
+            logger.info("ℹ️ Nada novo para publicar. Push ignorado.")
 
 if __name__ == "__main__":
     asyncio.run(main())

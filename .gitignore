@@ -28,3 +28,5 @@ venv/
 logs/
 
 create_and_push_repo.sh
+
+temp_downloads/
