@@ -46,35 +46,60 @@ logging.basicConfig(
 )
 logger = logging.getLogger("APK_Downloader")
 
-class ProgressFile:
-    def __init__(self, file_path: str, label: str, total_size: int, step_percent: int = 5):
-        self._fh = open(file_path, "rb")
+class ConsoleProgressBar:
+    def __init__(self, label: str, total_size: int = 0, width: int = 28):
         self.label = label
         self.total_size = total_size
-        self.step_percent = step_percent
+        self.width = width
+        self.current_bytes = 0
+        self.last_render = ""
+        self.disabled = not sys.stdout.isatty()
+
+    def update(self, current_bytes: int):
+        self.current_bytes = current_bytes
+        if self.disabled:
+            return
+
+        current_mb = current_bytes / (1024 * 1024)
+        if self.total_size:
+            total_mb = self.total_size / (1024 * 1024)
+            percent = min(current_bytes / self.total_size, 1)
+            filled = int(self.width * percent)
+            bar = "█" * filled + "·" * (self.width - filled)
+            line = f"\r{self.label}: [{bar}] {percent * 100:6.2f}% ({current_mb:.2f}/{total_mb:.2f} MB)"
+        else:
+            line = f"\r{self.label}: {current_mb:.2f} MB"
+
+        if line != self.last_render:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            self.last_render = line
+
+    def finish(self):
+        if self.disabled:
+            return
+        self.update(self.total_size or self.current_bytes)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        self.last_render = ""
+
+
+class ProgressFile:
+    def __init__(self, file_path: str, label: str, total_size: int):
+        self._fh = open(file_path, "rb")
+        self.total_size = total_size
         self.sent_bytes = 0
-        self.next_report_percent = step_percent
-        self.finished_logged = False
+        self.progress = ConsoleProgressBar(label, total_size)
 
     def read(self, size: int = -1):
         chunk = self._fh.read(size)
         if chunk:
             self.sent_bytes += len(chunk)
-            self._report_progress()
+            self.progress.update(self.sent_bytes)
         return chunk
 
-    def _report_progress(self):
-        if not self.total_size:
-            return
-        percent = int((self.sent_bytes / self.total_size) * 100)
-        while percent >= self.next_report_percent and self.next_report_percent < 100:
-            logger.info(f"⏫ {self.label}: {self.next_report_percent}%")
-            self.next_report_percent += self.step_percent
-        if self.sent_bytes >= self.total_size and not self.finished_logged:
-            logger.info(f"⏫ {self.label}: 100%")
-            self.finished_logged = True
-
     def close(self):
+        self.progress.finish()
         self._fh.close()
 
     def __len__(self):
@@ -195,6 +220,12 @@ class APKScraper:
                     final_url = unquote(str(final_url)).replace('&amp;', '&').strip()
                     logger.info(f"🚀 Link direto detectado: {final_url}")
 
+                    target_version = self.extract_version_from_text(urlparse(final_url).path) or self.extract_version_from_text(self.page.html)
+                    existing_apk = self.get_existing_apk_path(folder, app_name, target_version)
+                    if existing_apk:
+                        logger.info(f"⏭️ APK já existe localmente para {app_name} v{target_version}: {existing_apk}")
+                        return existing_apk
+
                     downloaded_file = await asyncio.to_thread(self.download_apk_with_requests, final_url)
                     if downloaded_file:
                         return await self.wait_and_move_download(folder, app_name, downloaded_file)
@@ -305,8 +336,7 @@ class APKScraper:
                     response.raise_for_status()
                     total_size = int(response.headers.get("content-length") or 0)
                     downloaded_bytes = 0
-                    next_percent_report = 5
-                    next_bytes_report = 25 * 1024 * 1024
+                    progress = ConsoleProgressBar("Download APK", total_size)
 
                     if total_size:
                         logger.info(f"📦 Tamanho do download: {total_size / (1024 * 1024):.2f} MB")
@@ -320,15 +350,9 @@ class APKScraper:
 
                             apk_file.write(chunk)
                             downloaded_bytes += len(chunk)
+                            progress.update(downloaded_bytes)
 
-                            if total_size:
-                                percent = int((downloaded_bytes / total_size) * 100)
-                                while percent >= next_percent_report and next_percent_report <= 100:
-                                    logger.info(f"⏬ Download APK: {next_percent_report}%")
-                                    next_percent_report += 5
-                            elif downloaded_bytes >= next_bytes_report:
-                                logger.info(f"⏬ Download APK: {downloaded_bytes / (1024 * 1024):.2f} MB recebidos")
-                                next_bytes_report += 25 * 1024 * 1024
+                    progress.finish()
 
                 os.replace(part_path, target_path)
                 logger.info(f"✅ Download concluído: {target_path}")
@@ -399,6 +423,20 @@ class APKScraper:
         if not match:
             return ""
         return match.group(1)
+
+    def extract_version_from_text(self, text: str) -> str:
+        candidate = os.path.basename(unquote(text or ""))
+        for pattern in (r'v(\d+(?:\.\d+)+)', r'(\d+(?:\.\d+){2,})'):
+            match = re.search(pattern, candidate, flags=re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return ""
+
+    def get_existing_apk_path(self, target_folder: str, app_name: str, version: str) -> str:
+        if not version:
+            return ""
+        apk_path = os.path.join(BASE_DIR, target_folder, f"{app_name}_v{version}.apk")
+        return apk_path if os.path.exists(apk_path) else ""
 
     def extract_apk_metadata(self, file_path: str) -> Dict[str, str]:
         if not APK:
