@@ -557,14 +557,21 @@ class APKScraper:
 
     def should_install_published_release(self, package_name: str, target_version: str) -> bool:
         if not package_name or not target_version:
+            logger.info("ℹ️ Não há package_name/versão suficientes para decidir instalação via release publicada.")
             return False
 
         adb_path = self.get_adb_path()
         if not adb_path:
+            logger.info("ℹ️ adb não encontrado. Release publicada será reaproveitada sem download local.")
             return False
 
         devices = self.list_connected_adb_devices()
-        if len(devices) != 1:
+        if not devices:
+            logger.info("ℹ️ Nenhum dispositivo adb conectado. Release publicada será reaproveitada sem download local.")
+            return False
+
+        if len(devices) > 1:
+            logger.info(f"ℹ️ Há múltiplos dispositivos adb conectados ({', '.join(devices)}). Download da release para instalação foi ignorado.")
             return False
 
         serial = devices[0]
