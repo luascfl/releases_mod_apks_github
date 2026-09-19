@@ -2,17 +2,6 @@
   "version": 1,
   "monitors": [
     {
-      "name": "Endel",
-      "folder": "Endel",
-      "repo": "endel",
-      "package_name": "com.endel.endel",
-      "enabled": true,
-      "source": {
-        "type": "liteapks",
-        "url": "https://liteapks.com/endel.html"
-      }
-    },
-    {
       "name": "CamScanner",
       "folder": "CamScanner",
       "repo": "camscanner",

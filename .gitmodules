@@ -1,6 +1,3 @@
-[submodule "Endel"]
-	path = Endel
-	url = https://github.com/luascfl/endel.git
 [submodule "CamScanner"]
 	path = CamScanner
 	url = https://github.com/luascfl/camscanner.git
