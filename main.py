@@ -2,9 +2,9 @@
 """
 Advanced APK Downloader - Native Download Edition
 """
-
 import os
 import sys
+import json
 import shutil
 import time
 import logging
@@ -18,6 +18,7 @@ import tempfile
 import glob
 import base64
 import requests
+from pathlib import Path
 from urllib.parse import urlparse, unquote
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any
@@ -29,12 +30,19 @@ except ImportError:
 
 # --- Configurações Locais ---
 HEADLESS_MODE = False
-BASE_DIR = os.getcwd()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(BASE_DIR, 'logs')
 # Pasta temporária para downloads do DrissionPage
 TEMP_DOWNLOAD_DIR = os.path.join(BASE_DIR, 'temp_downloads')
 DOWNLOADS_DIR = BASE_DIR
 
+MONITORS_FILE = os.path.join(BASE_DIR, "monitors.json")
+CENTRAL_GITHUB_TOKEN_FILE = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "send_folder_to_github",
+    "GITHUB_TOKEN.txt",
+)
+CANONICAL_PUSH_SCRIPT = os.path.expanduser("~/Downloads/send_folder_to_github/create_and_push_repo.sh")
 ALREADY_PUBLISHED = "__ALREADY_PUBLISHED__"
 
 for d in [LOGS_DIR, TEMP_DOWNLOAD_DIR]:
@@ -47,6 +55,221 @@ logging.basicConfig(
     handlers=[logging.FileHandler(os.path.join(LOGS_DIR, 'scraper.log')), logging.StreamHandler()]
 )
 logger = logging.getLogger("APK_Downloader")
+
+def load_github_token() -> str:
+    env_token = os.getenv("GITHUB_TOKEN", "").strip()
+    if env_token:
+        return env_token
+
+    for token_file in (CENTRAL_GITHUB_TOKEN_FILE, os.path.join(BASE_DIR, "GITHUB_TOKEN.txt")):
+        if os.path.exists(token_file):
+            with open(token_file, "r", encoding="utf-8") as fh:
+                token = fh.read().strip()
+            if token:
+                return token
+    return ""
+
+
+def validate_monitor(monitor: Dict[str, Any]) -> None:
+    required = ("name", "folder", "repo", "enabled", "source")
+    missing = [key for key in required if key not in monitor or monitor[key] in (None, "")]
+    if missing:
+        raise ValueError(f"Monitor sem campos obrigatórios: {', '.join(missing)}")
+    if "/" in monitor["folder"] or monitor["folder"] in (".", ".."):
+        raise ValueError(f"Pasta inválida: {monitor['folder']}")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", monitor["repo"]):
+        raise ValueError(f"Repositório inválido: {monitor['repo']}")
+    source = monitor["source"]
+    if not isinstance(source, dict) or source.get("type") not in ("liteapks", "custom"):
+        raise ValueError(f"Fonte inválida para {monitor['name']}")
+    if not isinstance(source.get("url"), str) or not source["url"].startswith(("https://", "http://")):
+        raise ValueError(f"URL inválida para {monitor['name']}")
+    if source["type"] == "custom" and not source.get("apk_link_selector"):
+        raise ValueError(f"Fonte customizada sem seletor do APK para {monitor['name']}")
+    if not isinstance(monitor["enabled"], bool):
+        raise ValueError(f"enabled deve ser booleano para {monitor['name']}")
+
+
+def load_monitors() -> List[Dict[str, Any]]:
+    with open(MONITORS_FILE, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    monitors = data.get("monitors")
+    if not isinstance(monitors, list):
+        raise ValueError("monitors.json precisa conter a lista 'monitors'.")
+
+    seen_folders = set()
+    seen_repos = set()
+    for monitor in monitors:
+        validate_monitor(monitor)
+        for value, seen, label in (
+            (monitor["folder"], seen_folders, "pasta"),
+            (monitor["repo"].lower(), seen_repos, "repositório"),
+        ):
+            if value in seen:
+                raise ValueError(f"{label.capitalize()} duplicado: {value}")
+            seen.add(value)
+    return monitors
+
+
+def save_monitors(monitors: List[Dict[str, Any]]) -> None:
+    for monitor in monitors:
+        validate_monitor(monitor)
+    temp_file = f"{MONITORS_FILE}.tmp"
+    with open(temp_file, "w", encoding="utf-8") as fh:
+        json.dump({"version": 1, "monitors": monitors}, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    os.replace(temp_file, MONITORS_FILE)
+
+
+def choose_monitor(monitors: List[Dict[str, Any]], prompt: str) -> Dict[str, Any] | None:
+    if not monitors:
+        print("Nenhum monitor configurado.")
+        return None
+    for index, monitor in enumerate(monitors, start=1):
+        status = "ativo" if monitor["enabled"] else "desativado"
+        print(f"  {index}. {monitor['name']} [{status}] → {monitor['repo']}")
+    raw = input(prompt).strip()
+    if not raw.isdigit() or not 1 <= int(raw) <= len(monitors):
+        print("Seleção inválida.")
+        return None
+    return monitors[int(raw) - 1]
+
+
+def prompt_new_monitor(monitors: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    name = input("Nome do app: ").strip()
+    folder = input("Pasta local/submodule: ").strip()
+    repo = input("Repositório GitHub: ").strip()
+    package_name = input("Package Android, opcional: ").strip()
+    source_type = input("Tipo de fonte [liteapks/custom] (custom): ").strip().lower() or "custom"
+    source_url = input("URL da página monitorada: ").strip()
+    if source_type not in ("liteapks", "custom"):
+        print("Tipo de fonte inválido.")
+        return None
+
+    source: Dict[str, Any] = {"type": source_type, "url": source_url}
+    if source_type == "custom":
+        click_selectors = input("Seletores CSS para clicar, separados por vírgula, opcional: ").strip()
+        apk_link_selector = input("Seletor CSS do link final do APK: ").strip()
+        source["click_selectors"] = [item.strip() for item in click_selectors.split(",") if item.strip()]
+        source["apk_link_selector"] = apk_link_selector
+
+    monitor = {
+        "name": name,
+        "folder": folder,
+        "repo": repo,
+        "package_name": package_name,
+        "enabled": True,
+        "source": source,
+    }
+    try:
+        validate_monitor(monitor)
+    except ValueError as exc:
+        print(f"Configuração recusada: {exc}")
+        return None
+    if any(item["folder"] == folder or item["repo"].lower() == repo.lower() for item in monitors):
+        print("Já existe monitor com essa pasta ou repositório.")
+        return None
+    return monitor
+
+
+def remove_local_monitor(monitor: Dict[str, Any]) -> None:
+    folder = monitor["folder"]
+    target = Path(BASE_DIR, folder).resolve()
+    if target.parent != Path(BASE_DIR).resolve():
+        raise ValueError(f"Recusando apagar fora do repositório: {target}")
+
+    if target.exists():
+        subprocess.run(["git", "submodule", "deinit", "-f", "--", folder], cwd=BASE_DIR, check=False)
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", folder],
+            cwd=BASE_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if tracked.returncode == 0:
+            subprocess.run(["git", "rm", "-f", "--", folder], cwd=BASE_DIR, check=True)
+        else:
+            shutil.rmtree(target)
+
+    module_gitdir = Path(BASE_DIR, ".git", "modules", folder)
+    shutil.rmtree(module_gitdir, ignore_errors=True)
+    state_file = Path(BASE_DIR, ".subcontainers")
+    if state_file.exists():
+        kept = [
+            line for line in state_file.read_text(encoding="utf-8").splitlines()
+            if not line.startswith(f"{folder}|")
+        ]
+        state_file.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+
+
+def push_monitor_configuration() -> bool:
+    if not os.path.isfile(CANONICAL_PUSH_SCRIPT):
+        print(f"Script de push não encontrado: {CANONICAL_PUSH_SCRIPT}")
+        return False
+    result = subprocess.run([CANONICAL_PUSH_SCRIPT, "push"], cwd=BASE_DIR, check=False)
+    return result.returncode == 0
+
+
+def delete_remote_repo(repo: str) -> bool:
+    token = load_github_token()
+    if not token:
+        print("Token GitHub ausente. O repositório remoto não foi apagado.")
+        return False
+    response = requests.delete(
+        f"https://api.github.com/repos/luascfl/{repo}",
+        headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+        timeout=30,
+    )
+    if response.status_code in (204, 404):
+        return True
+    print(f"Falha ao apagar o repositório remoto: HTTP {response.status_code} {response.text[:200]}")
+    return False
+
+
+def configure_monitors() -> None:
+    while True:
+        monitors = load_monitors()
+        print("\nMonitores de APK")
+        for index, monitor in enumerate(monitors, start=1):
+            status = "ativo" if monitor["enabled"] else "desativado"
+            print(f"  {index}. {monitor['name']} [{status}] | {monitor['source']['url']} | {monitor['repo']}")
+        print("\n1. Adicionar  2. Ativar/desativar  3. Apagar site, APK e repositório  0. Sair")
+        action = input("Ação: ").strip()
+        if action == "0":
+            return
+        if action == "1":
+            monitor = prompt_new_monitor(monitors)
+            if monitor:
+                monitors.append(monitor)
+                save_monitors(monitors)
+                print(f"Monitor {monitor['name']} adicionado e ativado.")
+            continue
+        if action == "2":
+            monitor = choose_monitor(monitors, "Número do monitor: ")
+            if monitor:
+                monitor["enabled"] = not monitor["enabled"]
+                save_monitors(monitors)
+                print(f"Monitor {monitor['name']} {'ativado' if monitor['enabled'] else 'desativado'}.")
+            continue
+        if action == "3":
+            monitor = choose_monitor(monitors, "Número do monitor a apagar: ")
+            if not monitor:
+                continue
+            confirmation = input(f"Digite DELETE {monitor['repo']} para apagar a fonte, APKs locais e repositório GitHub: ").strip()
+            if confirmation != f"DELETE {monitor['repo']}":
+                print("Remoção cancelada.")
+                continue
+            remove_local_monitor(monitor)
+            monitors.remove(monitor)
+            save_monitors(monitors)
+            if not push_monitor_configuration():
+                print("Configuração local removida, mas o push falhou. O repositório remoto foi preservado.")
+                continue
+            if delete_remote_repo(monitor["repo"]):
+                print(f"Monitor e repositório {monitor['repo']} apagados.")
+            continue
+        print("Ação inválida.")
 
 class ConsoleProgressBar:
     def __init__(self, label: str, total_size: int = 0, width: int = 28):
@@ -162,9 +385,9 @@ class APKScraper:
             raise
 
     async def process_liteapks(self, app_config: Dict):
-        url = app_config['url']
-        app_name = app_config['name']
-        folder = app_config['folder']
+        url = app_config["source"]["url"]
+        app_name = app_config["name"]
+        folder = app_config["folder"]
         
         logger.info(f"🌐 Navegando para {app_name}: {url}")
         self.page.get(url)
@@ -219,41 +442,84 @@ class APKScraper:
                     """)
                 
                 if final_url:
-                    final_url = unquote(str(final_url)).replace('&amp;', '&').strip()
-                    logger.info(f"🚀 Link direto detectado: {final_url}")
+                    return await self.process_final_download_url(app_config, final_url)
 
-                    target_version = self.extract_version_from_text(urlparse(final_url).path) or self.extract_version_from_text(self.page.html)
-                    existing_apk = self.get_existing_apk_path(folder, app_name, target_version)
-                    if existing_apk:
-                        logger.info(f"⏭️ APK já existe localmente para {app_name} v{target_version}: {existing_apk}")
-                        return existing_apk
-
-                    expected_asset_name = f"{app_name}_v{target_version}.apk" if target_version else ""
-                    if self.release_asset_exists(app_config['repo'], target_version, expected_asset_name):
-                        logger.info(f"⏭️ Release já publicada para {app_name} v{target_version}: {expected_asset_name}.")
-                        if self.should_install_published_release(app_config.get('package_name', ''), target_version):
-                            logger.info("📥 Baixando asset da release publicada para instalar/atualizar via adb...")
-                            published_asset = await asyncio.to_thread(
-                                self.download_published_release_asset,
-                                app_config['repo'],
-                                target_version,
-                                expected_asset_name,
-                            )
-                            if published_asset:
-                                return await self.wait_and_move_download(folder, app_name, published_asset)
-                            logger.error("❌ Falha ao baixar asset já publicado para instalação via adb.")
-                            return ""
-                        logger.info("ℹ️ Download ignorado porque a release já está publicada e não há necessidade de instalar localmente.")
-                        return ALREADY_PUBLISHED
-
-                    downloaded_file = await asyncio.to_thread(self.download_apk_with_requests, final_url)
-                    if downloaded_file:
-                        return await self.wait_and_move_download(folder, app_name, downloaded_file)
-
-                    logger.error("❌ Falha no download direto do APK.")
-                    return ""
-                
                 logger.error("❌ Não foi possível encontrar o link final decodificado.")
+        return ""
+
+    async def process_custom_site(self, app_config: Dict[str, Any]) -> str:
+        source = app_config["source"]
+        logger.info(f"🌐 Navegando para {app_config['name']}: {source['url']}")
+        self.page.get(source["url"])
+
+        for selector in source.get("click_selectors", []):
+            element = self.page.ele(f"css:{selector}", timeout=15)
+            if not element:
+                logger.error(f"❌ Seletor não encontrado em {app_config['name']}: {selector}")
+                return ""
+            element.click(by_js=True)
+            await asyncio.sleep(source.get("click_wait_seconds", 5))
+
+        selector = source["apk_link_selector"]
+        selector_json = json.dumps(selector)
+        final_url = self.page.run_js(f"""
+            const element = document.querySelector({selector_json});
+            if (!element) return null;
+            const href = element.getAttribute('href') || element.href || element.getAttribute('data-href');
+            if (!href) return null;
+            try {{ return atob(href); }} catch (_) {{ return href; }}
+        """)
+        if not final_url:
+            logger.error(f"❌ Seletor não retornou um link de APK para {app_config['name']}: {selector}")
+            return ""
+        return await self.process_final_download_url(app_config, str(final_url))
+
+    async def process_final_download_url(self, app_config: Dict[str, Any], final_url: str) -> str:
+        app_name = app_config["name"]
+        folder = app_config["folder"]
+        final_url = unquote(final_url).replace("&amp;", "&").strip()
+        if not final_url.startswith(("https://", "http://")):
+            logger.error(f"❌ Link de APK inválido para {app_name}: {final_url}")
+            return ""
+        logger.info(f"🚀 Link direto detectado: {final_url}")
+
+        target_version = self.extract_version_from_text(urlparse(final_url).path) or self.extract_version_from_text(self.page.html)
+        existing_apk = self.get_existing_apk_path(folder, app_name, target_version)
+        if existing_apk:
+            logger.info(f"⏭️ APK já existe localmente para {app_name} v{target_version}: {existing_apk}")
+            return existing_apk
+
+        expected_asset_name = f"{app_name}_v{target_version}.apk" if target_version else ""
+        if self.release_asset_exists(app_config["repo"], target_version, expected_asset_name):
+            logger.info(f"⏭️ Release já publicada para {app_name} v{target_version}: {expected_asset_name}.")
+            if self.should_install_published_release(app_config.get("package_name", ""), target_version):
+                logger.info("📥 Baixando asset da release publicada para instalar/atualizar via adb...")
+                published_asset = await asyncio.to_thread(
+                    self.download_published_release_asset,
+                    app_config["repo"],
+                    target_version,
+                    expected_asset_name,
+                )
+                if published_asset:
+                    return await self.wait_and_move_download(folder, app_name, published_asset)
+                logger.error("❌ Falha ao baixar asset já publicado para instalação via adb.")
+                return ""
+            logger.info("ℹ️ Download ignorado porque a release já está publicada e não há necessidade de instalar localmente.")
+            return ALREADY_PUBLISHED
+
+        downloaded_file = await asyncio.to_thread(self.download_apk_with_requests, final_url)
+        if downloaded_file:
+            return await self.wait_and_move_download(folder, app_name, downloaded_file)
+        logger.error("❌ Falha no download direto do APK.")
+        return ""
+
+    async def process_monitor(self, app_config: Dict[str, Any]) -> str:
+        source_type = app_config["source"]["type"]
+        if source_type == "liteapks":
+            return await self.process_liteapks(app_config)
+        if source_type == "custom":
+            return await self.process_custom_site(app_config)
+        logger.error(f"❌ Tipo de fonte não suportado: {source_type}")
         return ""
                         
 
@@ -519,15 +785,7 @@ class APKScraper:
 
 
     def load_github_token(self) -> str:
-        env_token = os.getenv("GITHUB_TOKEN", "").strip()
-        if env_token:
-            return env_token
-
-        token_file = os.path.join(BASE_DIR, "GITHUB_TOKEN.txt")
-        if not os.path.exists(token_file):
-            return ""
-        with open(token_file, "r", encoding="utf-8") as fh:
-            return fh.read().strip()
+        return load_github_token()
 
     def release_asset_exists(self, repo_name: str, version: str, asset_name: str) -> bool:
         if not version or not asset_name:
@@ -888,10 +1146,10 @@ async def main():
     print(f"🚀 APK BUILDER (Native Download Mode)")
     print("="*50)
 
-    apps = [
-        {"name": "Endel", "folder": "Endel", "repo": "endel", "package_name": "com.endel.endel", "url": "https://liteapks.com/endel.html"},
-        {"name": "CamScanner", "folder": "CamScanner", "repo": "CamScanner", "package_name": "com.intsig.camscanner", "url": "https://liteapks.com/camscanner.html"}
-    ]
+    apps = [app for app in load_monitors() if app["enabled"]]
+    if not apps:
+        logger.info("ℹ️ Não há monitores ativos. Use `python3 main.py configure` para ativar ou cadastrar um.")
+        return
 
     scraper = APKScraper()
     should_push = False
@@ -899,7 +1157,7 @@ async def main():
         await scraper.init_browser()
         for app in apps:
             print(f"\n📱 {app['name']}...")
-            final_apk_path = await scraper.process_liteapks(app)
+            final_apk_path = await scraper.process_monitor(app)
             if final_apk_path == ALREADY_PUBLISHED:
                 logger.info(f"ℹ️ {app['name']} já está publicado na release. Nada para baixar.")
                 continue
@@ -920,15 +1178,19 @@ async def main():
         await scraper.cleanup()
         print("\n🏁 Finalizado.")
         if should_push:
-            print("\n🚀 Iniciando Push para GitHub (Subfolders + Releases)...")
+            print("\n🚀 Iniciando Push para GitHub...")
             try:
-                subprocess.run(["./create_and_push_repo.sh", "push"], check=True)
-                print("✅ Push e Releases concluídos!")
-                print("\n🔗 LINKS DAS ÚLTIMAS RELEASES:")
+                subprocess.run([CANONICAL_PUSH_SCRIPT, "push"], cwd=BASE_DIR, check=True)
+                print("✅ Push concluído!")
             except subprocess.CalledProcessError as exc:
                 logger.error(f"❌ Falha no push/repos: {exc}")
         else:
             logger.info("ℹ️ Nada novo para publicar. Push ignorado.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if len(sys.argv) == 2 and sys.argv[1] == "configure":
+        configure_monitors()
+    elif len(sys.argv) == 1:
+        asyncio.run(main())
+    else:
+        raise SystemExit("Uso: python3 main.py [configure]")
