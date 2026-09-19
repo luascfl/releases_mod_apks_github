@@ -1,16 +1,4 @@
 {
   "version": 1,
-  "monitors": [
-    {
-      "name": "CamScanner",
-      "folder": "CamScanner",
-      "repo": "camscanner",
-      "package_name": "com.intsig.camscanner",
-      "enabled": true,
-      "source": {
-        "type": "liteapks",
-        "url": "https://liteapks.com/camscanner.html"
-      }
-    }
-  ]
+  "monitors": []
 }
